@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Amazon ASIN Scraper</title>
+  <meta name="description" content="Upload ASINs, scrape Amazon product data, and export to Excel." />
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+  />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet"
+  />
+  <style>
+    :root {
+      --bg-body: #0d0f17;
+      --bg-card: #14172380;
+      --bg-card-solid: #161a26;
+      --accent: #ff9900;
+      --accent-glow: rgba(255, 153, 0, .35);
+      --accent2: #146eb4;
+      --accent2-glow: rgba(20, 110, 180, .3);
+      --green: #22c55e;
+      --yellow: #facc15;
+      --border: rgba(255,255,255,.06);
+      --text-muted: #8b8fa3;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg-body);
+      color: #e2e4ed;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* animated bg blobs */
+    body::before, body::after {
+      content: '';
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(120px);
+      opacity: .25;
+      z-index: -1;
+      pointer-events: none;
+      animation: float 18s ease-in-out infinite alternate;
+    }
+    body::before { width: 600px; height: 600px; background: var(--accent); top: -200px; left: -100px; }
+    body::after  { width: 500px; height: 500px; background: var(--accent2); bottom: -200px; right: -100px; animation-delay: -9s; }
+    @keyframes float {
+      0%   { transform: translate(0, 0) scale(1);   }
+      100% { transform: translate(60px, 40px) scale(1.1); }
+    }
+
+    /* glass card */
+    .glass {
+      background: var(--bg-card);
+      backdrop-filter: blur(18px) saturate(1.4);
+      -webkit-backdrop-filter: blur(18px) saturate(1.4);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.35);
+    }
+
+    .hero-title {
+      font-weight: 700;
+      font-size: 2.4rem;
+      background: linear-gradient(135deg, #fff 30%, var(--accent) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero-sub { color: var(--text-muted); font-size: .95rem; }
+
+    /* upload zone */
+    .upload-zone {
+      border: 2px dashed rgba(255,255,255,.12);
+      border-radius: 16px;
+      padding: 2.5rem 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: all .3s ease;
+      background: rgba(255,255,255,.02);
+      position: relative;
+    }
+    .upload-zone:hover,
+    .upload-zone.drag-over {
+      border-color: var(--accent);
+      background: rgba(255, 153, 0, .06);
+      box-shadow: 0 0 30px rgba(255, 153, 0, .1);
+    }
+    .upload-zone .upload-icon {
+      font-size: 3rem;
+      margin-bottom: .5rem;
+      display: block;
+    }
+    .upload-zone .upload-text {
+      font-size: 1rem;
+      font-weight: 500;
+      color: #b0b3c5;
+    }
+    .upload-zone .upload-hint {
+      font-size: .78rem;
+      color: var(--text-muted);
+      margin-top: .3rem;
+    }
+    .upload-zone input[type="file"] {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      cursor: pointer;
+    }
+    .file-selected {
+      border-color: var(--green) !important;
+      background: rgba(34, 197, 94, .06) !important;
+    }
+    .file-name {
+      font-weight: 600;
+      color: var(--green);
+      font-size: .9rem;
+      margin-top: .5rem;
+    }
+
+    /* buttons */
+    .btn-glow {
+      padding: .6rem 1.8rem;
+      border-radius: 12px;
+      font-weight: 600;
+      border: none;
+      transition: transform .2s, box-shadow .3s;
+      cursor: pointer;
+    }
+    .btn-start {
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color: #fff;
+      box-shadow: 0 4px 20px var(--accent-glow);
+    }
+    .btn-start:hover { transform: translateY(-2px); box-shadow: 0 8px 30px var(--accent-glow); color:#fff; }
+    .btn-start:disabled { opacity: .5; transform: none; cursor: not-allowed; }
+
+    .btn-stop {
+      background: rgba(239,68,68,.15);
+      color: #f87171;
+      border: 1px solid rgba(239,68,68,.25);
+    }
+    .btn-stop:hover { background: rgba(239,68,68,.25); color: #fca5a5; }
+
+    .btn-download {
+      background: linear-gradient(135deg, var(--green), #16a34a);
+      color: #fff;
+      box-shadow: 0 4px 20px rgba(34,197,94,.3);
+    }
+    .btn-download:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(34,197,94,.35); color:#fff; }
+
+    /* log area */
+    #log-container {
+      background: #0b0d14;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      height: 420px;
+      overflow-y: auto;
+      padding: 1rem 1.2rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .82rem;
+      line-height: 1.7;
+    }
+    #log-container::-webkit-scrollbar { width: 6px; }
+    #log-container::-webkit-scrollbar-track { background: transparent; }
+    #log-container::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 3px; }
+
+    .log-line { padding: 1px 0; word-break: break-all; }
+    .log-line.error  { color: #f87171; }
+    .log-line.done   { color: var(--green); font-weight: 600; }
+    .log-line.stop   { color: var(--yellow); font-weight: 600; }
+    .log-line.info   { color: #60a5fa; }
+
+    /* stats badges */
+    .stat-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(255,255,255,.04);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: .35rem .8rem;
+      font-size: .82rem;
+      font-weight: 500;
+      color: var(--text-muted);
+    }
+    .stat-badge .num { color: #fff; font-weight: 700; font-size: .95rem; }
+
+    /* progress bar */
+    .scrape-progress { height: 6px; border-radius: 3px; background: rgba(255,255,255,.06); overflow: hidden; }
+    .scrape-progress-bar {
+      height: 100%;
+      border-radius: 3px;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      transition: width .4s ease;
+    }
+
+    /* pulse animation */
+    .pulse { animation: pulse-anim 1.5s ease-in-out infinite; }
+    @keyframes pulse-anim {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: .5; }
+    }
+
+    /* format hint */
+    .format-hint {
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: .6rem 1rem;
+      font-size: .78rem;
+      color: var(--text-muted);
+    }
+    .format-hint code {
+      background: rgba(255,255,255,.08);
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #ff9900;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .75rem;
+    }
+    .format-hint table {
+      margin-top: .4rem;
+      width: auto;
+    }
+    .format-hint th, .format-hint td {
+      padding: .2rem .6rem;
+      border: 1px solid rgba(255,255,255,.08);
+      font-size: .75rem;
+    }
+    .format-hint th {
+      background: rgba(255, 153, 0, .15);
+      color: #ff9900;
+      font-weight: 600;
+    }
+    .format-hint td {
+      color: #b0b3c5;
+    }
+
+    .footer-text { font-size: .75rem; color: rgba(255,255,255,.25); }
+
+    @media (max-width: 768px) {
+      .hero-title { font-size: 1.6rem; }
+      #log-container { height: 320px; }
+      .upload-zone { padding: 1.5rem 1rem; }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container py-4" style="max-width:860px;">
+
+    <!-- Hero -->
+    <div class="text-center mb-4 pt-3">
+      <h1 class="hero-title">📦 Amazon ASIN Scraper</h1>
+      <p class="hero-sub">Upload ASINs → Scrape product data → Download Excel</p>
+    </div>
+
+    <!-- Main Card -->
+    <div class="glass p-4 mb-4">
+
+      <!-- Upload Zone -->
+      <div id="upload-zone" class="upload-zone">
+        <span class="upload-icon">📄</span>
+        <div class="upload-text">Drag & drop your Excel file here, or click to browse</div>
+        <div class="upload-hint">Accepts <strong>.xlsx</strong> / <strong>.xls</strong> files with an "ASIN" column</div>
+        <div id="file-name" class="file-name" style="display:none;"></div>
+        <input type="file" id="file-input" accept=".xlsx,.xls" />
+      </div>
+
+      <!-- Format hint -->
+      <div class="format-hint mt-3">
+        💡 <strong>Expected format:</strong> Excel file with a column named <code>ASIN</code>
+        <table>
+          <thead><tr><th>ASIN</th></tr></thead>
+          <tbody>
+            <tr><td>B0G4RCKKRX</td></tr>
+            <tr><td>B0G4RJBBJR</td></tr>
+            <tr><td>B0D2DLQMGY</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Start button -->
+      <div class="d-grid mt-3">
+        <button id="btn-start" class="btn btn-glow btn-start" onclick="startScraping()" disabled>
+          🚀 Upload & Start Scraping
+        </button>
+      </div>
+
+      <!-- Status Row -->
+      <div id="status-row" class="d-flex flex-wrap gap-2 align-items-center mt-3" style="display:none!important;">
+        <span class="stat-badge">Total ASINs: <span class="num" id="total-count">—</span></span>
+        <span class="stat-badge">Scraped: <span class="num" id="scraped-count">0</span></span>
+        <span class="stat-badge" style="color:#f87171;">Failed: <span class="num" id="failed-count" style="color:#f87171;">0</span></span>
+        <div class="ms-auto d-flex gap-2">
+          <button id="btn-stop" class="btn btn-glow btn-stop" onclick="stopScraping()" style="display:none;">⏹ Stop</button>
+          <a id="btn-download" class="btn btn-glow btn-download" href="/download" style="display:none;">📥 Download Excel</a>
+        </div>
+      </div>
+
+      <!-- Progress bar -->
+      <div id="progress-wrapper" class="mt-3" style="display:none;">
+        <div class="scrape-progress">
+          <div id="progress-bar" class="scrape-progress-bar" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Log Area -->
+    <div class="glass p-3">
+      <div class="d-flex justify-content-between align-items-center mb-2 px-1">
+        <span style="font-weight:600; font-size:.9rem;">Live Logs</span>
+        <span id="live-dot" style="display:none;">
+          <span class="pulse" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--green);"></span>
+          <span style="font-size:.75rem; color:var(--green); margin-left:4px;">LIVE</span>
+        </span>
+      </div>
+      <div id="log-container"><span style="color:var(--text-muted);">Upload an Excel file with ASINs to begin…</span></div>
+    </div>
+
+    <div class="text-center mt-3">
+      <p class="footer-text">⚠ This tool is for educational purposes only. Use responsibly.</p>
+    </div>
+  </div>
+
+  <script>
+    let evtSource = null;
+    let isRunning = false;
+    let selectedFile = null;
+
+    function $(id) { return document.getElementById(id); }
+
+    // ---------- Drag & Drop ----------
+    const uploadZone = $('upload-zone');
+    const fileInput = $('file-input');
+
+    ['dragenter', 'dragover'].forEach(evt => {
+      uploadZone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        uploadZone.classList.add('drag-over');
+      });
+    });
+    ['dragleave', 'drop'].forEach(evt => {
+      uploadZone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        uploadZone.classList.remove('drag-over');
+      });
+    });
+    uploadZone.addEventListener('drop', (e) => {
+      const files = e.dataTransfer.files;
+      if (files.length) {
+        fileInput.files = files;
+        handleFileSelect(files[0]);
+      }
+    });
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length) {
+        handleFileSelect(fileInput.files[0]);
+      }
+    });
+
+    function handleFileSelect(file) {
+      selectedFile = file;
+      const fname = file.name;
+      const ext = fname.split('.').pop().toLowerCase();
+      if (ext !== 'xlsx' && ext !== 'xls') {
+        alert('Please select an .xlsx or .xls file.');
+        selectedFile = null;
+        fileInput.value = '';
+        return;
+      }
+      $('file-name').textContent = '📎 ' + fname;
+      $('file-name').style.display = 'block';
+      uploadZone.classList.add('file-selected');
+      $('btn-start').disabled = false;
+    }
+
+    // ---------- Logging ----------
+    function addLog(line) {
+      const container = $('log-container');
+      if (container.querySelector('span')) container.innerHTML = '';
+      const div = document.createElement('div');
+      div.className = 'log-line';
+      if (line.includes('✗') || line.includes('Error') || line.includes('⚠') || line.includes('FAILED') || line.includes('CAPTCHA')) div.className += ' error';
+      else if (line.includes('DONE') || line.includes('✅')) div.className += ' done';
+      else if (line.includes('STOP')) div.className += ' stop';
+      else if (line.includes('🔍') || line.includes('Found')) div.className += ' info';
+      div.textContent = line;
+      container.appendChild(div);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function setRunning(val) {
+      isRunning = val;
+      $('btn-start').disabled = val;
+      $('btn-stop').style.display = val ? 'inline-block' : 'none';
+      $('live-dot').style.display = val ? 'inline' : 'none';
+      $('status-row').style.cssText = '';
+      if (val) {
+        $('progress-wrapper').style.display = 'block';
+        $('btn-download').style.display = 'none';
+      }
+    }
+
+    // ---------- Scraping ----------
+    async function startScraping() {
+      if (!selectedFile) {
+        alert('Please select a file first.');
+        return;
+      }
+
+      // Reset UI
+      $('log-container').innerHTML = '';
+      $('scraped-count').textContent = '0';
+      $('failed-count').textContent = '0';
+      $('total-count').textContent = '—';
+      $('progress-bar').style.width = '0%';
+      $('btn-download').style.display = 'none';
+
+      // Upload file
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+
+      const resp = await fetch('/upload', {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await resp.json();
+
+      if (data.status === 'error') {
+        addLog('❌ ' + data.message);
+        return;
+      }
+
+      $('total-count').textContent = data.total;
+      setRunning(true);
+
+      // Connect SSE
+      if (evtSource) evtSource.close();
+      evtSource = new EventSource('/progress');
+
+      evtSource.onmessage = (e) => {
+        const msg = e.data;
+        if (msg === '__END__') {
+          evtSource.close();
+          setRunning(false);
+          return;
+        }
+        if (msg === '__FILE_READY__') {
+          $('btn-download').style.display = 'inline-block';
+          return;
+        }
+        addLog(msg);
+
+        // Parse progress
+        const matchProgress = msg.match(/\[(\d+)\/(\d+)\]/);
+        if (matchProgress) {
+          const scraped = parseInt(matchProgress[1]);
+          const total = parseInt(matchProgress[2]);
+          $('scraped-count').textContent = scraped;
+          const pct = total > 0 ? Math.round((scraped / total) * 100) : 0;
+          $('progress-bar').style.width = pct + '%';
+        }
+
+        // Parse failed count
+        if (msg.includes('FAILED') || msg.includes('CAPTCHA')) {
+          const currentFailed = parseInt($('failed-count').textContent) || 0;
+          $('failed-count').textContent = currentFailed + 1;
+        }
+
+        // Parse total from start message
+        const matchTotal = msg.match(/(\d+)\s+ASINs/);
+        if (matchTotal) {
+          $('total-count').textContent = matchTotal[1];
+        }
+      };
+
+      evtSource.onerror = () => {
+        evtSource.close();
+        setRunning(false);
+      };
+    }
+
+    async function stopScraping() {
+      await fetch('/stop', { method: 'POST' });
+      addLog('🛑 Stop signal sent — finishing current operations…');
+    }
+  </script>
+</body>
+</html>
