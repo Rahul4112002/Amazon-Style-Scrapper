@@ -92,6 +92,23 @@ def get_headers() -> dict:
 MAX_CONCURRENCY = 3  # Lower concurrency for Amazon to avoid rate limiting
 
 DETAIL_LABEL_TO_COLUMN = {
+    "Closure type": "closure_type",
+    "Outer material": "outer_material",
+    "Style": "style",
+    "Care instructions": "care_instructions",
+    "Occasion type": "occasion_type",
+    "Number of pockets": "number_of_pockets",
+    "Colour": "colors",
+    "Color": "colors",
+    "Size": "sizes",
+    "StyleName": "style_name",
+    "Handbag Silhouette": "handbag_silhouette",
+    "Pattern": "pattern",
+    "Season": "season",
+    "Subject Character": "subject_character",
+    "Item Shape": "item_shape",
+    "Strap Color": "strap_color",
+    "Occasion description": "occasion_description",
     "Product Dimensions": "product_dimensions",
     "Date First Available": "date_first_available",
     "Manufacturer": "manufacturer",
@@ -103,13 +120,33 @@ DETAIL_LABEL_TO_COLUMN = {
     "Item Weight": "item_weight",
     "Item Dimensions LxWxH": "item_dimensions_lxwxh",
     "Net Quantity": "net_quantity",
+    "Included Components": "included_components",
     "Generic Name": "generic_name",
+    "Importer Contact Information": "importer_contact_information",
+    "Manufacturer Contact Information": "manufacturer_contact_information",
+    "Packer Contact Information": "packer_contact_information",
+    "Age Range Description": "age_range_description",
     "Best Sellers Rank": "best_sellers_rank",
+    "Customer Reviews": "customer_reviews",
     # Keep ASIN in the primary asin column instead of creating a duplicate.
     "ASIN": "asin",
 }
 
 DETAIL_COLUMNS = [
+    "closure_type",
+    "outer_material",
+    "style",
+    "care_instructions",
+    "occasion_type",
+    "number_of_pockets",
+    "style_name",
+    "handbag_silhouette",
+    "pattern",
+    "season",
+    "subject_character",
+    "item_shape",
+    "strap_color",
+    "occasion_description",
     "product_dimensions",
     "date_first_available",
     "manufacturer",
@@ -121,8 +158,17 @@ DETAIL_COLUMNS = [
     "item_weight",
     "item_dimensions_lxwxh",
     "net_quantity",
+    "included_components",
     "generic_name",
+    "importer_contact_information",
+    "manufacturer_contact_information",
+    "packer_contact_information",
+    "age_range_description",
     "best_sellers_rank",
+    "customer_reviews",
+    "about_this_item",
+    "top_reviews_india",
+    "top_reviews_other_countries",
 ]
 
 BASE_EXPORT_COLUMNS = [
@@ -218,16 +264,116 @@ def _merge_unique(existing: Any, new_value: Any) -> str:
     return " | ".join(parts)
 
 
+def _label_to_column(label: str) -> str:
+    mapped = DETAIL_LABEL_TO_COLUMN.get(label)
+    if mapped:
+        return mapped
+    column = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+    return column[:80]
+
+
 def _add_product_detail(data: dict[str, Any], details_parts: list[str], label: Any, value: Any) -> None:
     label_text = _normalize_detail_label(label)
     value_text = _clean_detail_value(value, label_text)
-    if not label_text or not value_text or label_text.lower().startswith("customer"):
+    if not label_text or not value_text:
         return
 
-    details_parts.append(f"{label_text}: {value_text}")
-    column = DETAIL_LABEL_TO_COLUMN.get(label_text)
+    detail_part = f"{label_text}: {value_text}"
+    if detail_part not in details_parts:
+        details_parts.append(detail_part)
+    column = _label_to_column(label_text)
     if column and column != "asin":
         data[column] = _merge_unique(data.get(column, ""), value_text)
+
+
+def _extract_row_label_value(row) -> tuple[str, str]:
+    cells = row.select("th, td")
+    if len(cells) >= 2:
+        return _normalize_detail_label(cells[0].get_text()), _clean_detail_value(cells[1].get_text(), cells[0].get_text())
+
+    columns = row.select(".a-span3, .a-span4, .a-column.a-span3, .a-column.a-span4, .a-span9, .a-span8")
+    if len(columns) >= 2:
+        return _normalize_detail_label(columns[0].get_text()), _clean_detail_value(columns[1].get_text(), columns[0].get_text())
+
+    return "", ""
+
+
+def _extract_definition_list_details(soup: BeautifulSoup, data: dict[str, Any], details_parts: list[str]) -> None:
+    for label_el in soup.select("dt"):
+        value_el = label_el.find_next_sibling("dd")
+        if value_el:
+            _add_product_detail(data, details_parts, label_el.get_text(), value_el.get_text(" ", strip=True))
+
+
+def _extract_product_fact_sections(soup: BeautifulSoup, data: dict[str, Any], details_parts: list[str]) -> None:
+    selectors = [
+        "#productOverview_feature_div tr",
+        "#productFactsDesktop_feature_div tr",
+        "#productFactsDesktop_feature_div .a-row",
+        "#productDetails_expanderTables_depthLeftSections tr",
+        "#productDetails_expanderTables_depthRightSections tr",
+        "#productDetails_techSpec_section_1 tr",
+        "#productDetails_detailBullets_sections1 tr",
+        "#detailBullets_feature_div li",
+        "#detailBulletsWrapper_feature_div li",
+    ]
+
+    for row in soup.select(", ".join(selectors)):
+        key_el = row.select_one("th, span.a-text-bold")
+        if row.name == "li" and key_el:
+            _add_product_detail(data, details_parts, key_el.get_text(), row.get_text(" ", strip=True))
+            continue
+
+        label, value = _extract_row_label_value(row)
+        if label and value:
+            _add_product_detail(data, details_parts, label, value)
+
+    _extract_definition_list_details(soup, data, details_parts)
+
+
+def _extract_about_this_item(soup: BeautifulSoup) -> str:
+    bullets = []
+    for bullet in soup.select("#feature-bullets li span.a-list-item, #featurebullets_feature_div li span.a-list-item"):
+        text = _clean_text(bullet.get_text(" ", strip=True))
+        if text and not text.startswith("Make sure") and text not in bullets:
+            bullets.append(text)
+    return " | ".join(bullets)
+
+
+def _extract_review_snippets(soup: BeautifulSoup) -> tuple[str, str]:
+    india_reviews = []
+    other_country_reviews = []
+
+    for review in soup.select("#cm-cr-dp-review-list [data-hook='review'], #customerReviews [data-hook='review']"):
+        review_text_parts = []
+        for selector in (
+            "[data-hook='review-author']",
+            "[data-hook='review-star-rating']",
+            "[data-hook='review-title']",
+            "[data-hook='review-date']",
+            "[data-hook='review-body']",
+        ):
+            el = review.select_one(selector)
+            if el:
+                text = _clean_text(el.get_text(" ", strip=True))
+                if text and text not in review_text_parts:
+                    review_text_parts.append(text)
+
+        review_text = " - ".join(review_text_parts)
+        if not review_text:
+            continue
+
+        date_text = _clean_text((review.select_one("[data-hook='review-date']") or review).get_text(" ", strip=True))
+        target = other_country_reviews if "reviewed in india" not in date_text.lower() else india_reviews
+        if review_text not in target:
+            target.append(review_text)
+
+    return " | ".join(india_reviews[:5]), " | ".join(other_country_reviews[:5])
+
+
+def _finalize_current_product_details(data: dict[str, Any]) -> None:
+    if data.get("outer_material") and not data.get("material"):
+        data["material"] = data["outer_material"]
 
 
 def _parse_product_details_text(raw_details: Any) -> dict[str, str]:
@@ -461,14 +607,10 @@ def _parse_amazon_page(html: str, url: str, asin: str) -> dict[str, Any]:
     # 5. Description / Features
     # ================================================================
     # Feature bullets
-    feature_bullets = soup.select("#feature-bullets li span.a-list-item")
-    features_list = []
-    for bullet in feature_bullets:
-        text = _clean_text(bullet.get_text())
-        if text and not text.startswith("Make sure"):
-            features_list.append(text)
-    if features_list:
-        data["features"] = " | ".join(features_list[:10])
+    about_this_item = _extract_about_this_item(soup)
+    if about_this_item:
+        data["features"] = about_this_item
+        data["about_this_item"] = about_this_item
     
     # Product description
     desc_el = soup.select_one("#productDescription p, #productDescription")
@@ -539,40 +681,18 @@ def _parse_amazon_page(html: str, url: str, asin: str) -> dict[str, Any]:
             break
 
     # ================================================================
-    # 9. Colors / Variations
+    # 9-10. Current product color/size details only
     # ================================================================
-    color_buttons = soup.select("#variation_color_name li img, #color_name_0 option")
-    colors = []
-    for el in color_buttons:
-        color = el.get("alt") or el.get_text()
-        if color and color.strip() and color not in colors:
-            colors.append(_clean_text(color))
-    if colors:
-        data["colors"] = ", ".join(colors[:20])
-    
-    # Also check for color in title or product details
-    if not data["colors"]:
-        color_row = soup.select_one("tr.po-color td.a-span9 span")
-        if color_row:
-            data["colors"] = _clean_text(color_row.get_text())
-
-    # ================================================================
-    # 10. Sizes
-    # ================================================================
-    size_buttons = soup.select("#variation_size_name option, #native_dropdown_selected_size_name option")
-    sizes = []
-    for el in size_buttons:
-        size = _clean_text(el.get_text())
-        if size and size.lower() != "select" and size not in sizes:
-            sizes.append(size)
-    if sizes:
-        data["sizes"] = ", ".join(sizes[:30])
-    
-    # Size from product details
-    if not data["sizes"]:
-        size_row = soup.select_one("tr.po-size td.a-span9 span")
-        if size_row:
-            data["sizes"] = _clean_text(size_row.get_text())
+    for row in soup.select("tr.po-color, tr.po-size"):
+        key_el = row.select_one("td.a-span3 span, th")
+        value_el = row.select_one("td.a-span9 span, td")
+        if key_el and value_el:
+            key = _normalize_detail_label(key_el.get_text())
+            value = _clean_detail_value(value_el.get_text(), key)
+            if "color" in key.lower() or "colour" in key.lower():
+                data["colors"] = _merge_unique(data.get("colors", ""), value)
+            elif "size" in key.lower():
+                data["sizes"] = _merge_unique(data.get("sizes", ""), value)
 
     # ================================================================
     # 11. Material
@@ -623,16 +743,15 @@ def _parse_amazon_page(html: str, url: str, asin: str) -> dict[str, Any]:
     # 14. Product Details Table
     # ================================================================
     details_parts = []
-    for row in soup.select("#productDetails_techSpec_section_1 tr, #productDetails_detailBullets_sections1 tr"):
-        key_el = row.select_one("th")
-        value_el = row.select_one("td")
-        if key_el and value_el:
-            _add_product_detail(data, details_parts, key_el.get_text(), value_el.get_text())
+    _extract_product_fact_sections(soup, data, details_parts)
 
-    for item in soup.select("#detailBullets_feature_div li"):
-        key_el = item.select_one("span.a-text-bold")
-        if key_el:
-            _add_product_detail(data, details_parts, key_el.get_text(), item.get_text(" ", strip=True))
+    india_reviews, other_country_reviews = _extract_review_snippets(soup)
+    if india_reviews:
+        data["top_reviews_india"] = india_reviews
+    if other_country_reviews:
+        data["top_reviews_other_countries"] = other_country_reviews
+
+    _finalize_current_product_details(data)
 
     if details_parts:
         data["product_details"] = " | ".join(details_parts)
