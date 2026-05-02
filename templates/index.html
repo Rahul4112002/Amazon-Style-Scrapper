@@ -440,6 +440,34 @@
       $('total-count').textContent = data.total;
       setRunning(true);
 
+      if (data.status === 'completed') {
+        if (Array.isArray(data.logs)) {
+          data.logs.forEach(addLog);
+        } else {
+          addLog('✅ ' + data.message);
+        }
+        $('scraped-count').textContent = data.scraped ?? data.total ?? 0;
+        $('failed-count').textContent = data.failed ?? 0;
+        $('progress-bar').style.width = '100%';
+        setRunning(false);
+        if (data.file_base64 && data.file_name) {
+          const byteCharacters = atob(data.file_base64);
+          const byteNumbers = new Array(byteCharacters.length);
+          for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+          }
+          const blob = new Blob([new Uint8Array(byteNumbers)], {
+            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+          });
+          const downloadUrl = URL.createObjectURL(blob);
+          const downloadBtn = $('btn-download');
+          downloadBtn.href = downloadUrl;
+          downloadBtn.download = data.file_name;
+          downloadBtn.style.display = 'inline-block';
+        }
+        return;
+      }
+
       // Connect SSE
       if (evtSource) evtSource.close();
       evtSource = new EventSource('/progress');

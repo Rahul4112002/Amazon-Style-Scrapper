@@ -10,6 +10,7 @@ stream real-time logs via SSE, and export results to Excel.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -24,6 +25,8 @@ import httpx
 import pandas as pd
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, Request, UploadFile
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -34,10 +37,13 @@ from fastapi.templating import Jinja2Templates
 app = FastAPI(title="Amazon ASIN Scraper")
 templates = Jinja2Templates(directory="templates")
 
-DOWNLOADS_DIR = Path("downloads")
+IS_VERCEL = os.environ.get("VERCEL") == "1"
+STORAGE_ROOT = Path("/tmp") if IS_VERCEL else Path(".")
+
+DOWNLOADS_DIR = STORAGE_ROOT / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
-UPLOADS_DIR = Path("uploads")
+UPLOADS_DIR = STORAGE_ROOT / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
@@ -85,6 +91,65 @@ def get_headers() -> dict:
 
 MAX_CONCURRENCY = 3  # Lower concurrency for Amazon to avoid rate limiting
 
+DETAIL_LABEL_TO_COLUMN = {
+    "Product Dimensions": "product_dimensions",
+    "Date First Available": "date_first_available",
+    "Manufacturer": "manufacturer",
+    "Item model number": "item_model_number",
+    "Country of Origin": "country_of_origin",
+    "Department": "department",
+    "Packer": "packer",
+    "Importer": "importer",
+    "Item Weight": "item_weight",
+    "Item Dimensions LxWxH": "item_dimensions_lxwxh",
+    "Net Quantity": "net_quantity",
+    "Generic Name": "generic_name",
+    "Best Sellers Rank": "best_sellers_rank",
+    # Keep ASIN in the primary asin column instead of creating a duplicate.
+    "ASIN": "asin",
+}
+
+DETAIL_COLUMNS = [
+    "product_dimensions",
+    "date_first_available",
+    "manufacturer",
+    "item_model_number",
+    "country_of_origin",
+    "department",
+    "packer",
+    "importer",
+    "item_weight",
+    "item_dimensions_lxwxh",
+    "net_quantity",
+    "generic_name",
+    "best_sellers_rank",
+]
+
+BASE_EXPORT_COLUMNS = [
+    "asin",
+    "url",
+    "title",
+    "brand",
+    "current_price",
+    "original_price",
+    "discount",
+    "rating",
+    "rating_count",
+    "review_count",
+    "description",
+    "category",
+    "images",
+    "video_url",
+    "colors",
+    "sizes",
+    "material",
+    "seller",
+    "availability",
+    "features",
+]
+
+EXPORT_COLUMNS = BASE_EXPORT_COLUMNS + DETAIL_COLUMNS + ["product_details"]
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -106,6 +171,150 @@ def _clean_text(text: str) -> str:
     # Remove extra whitespace
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
+
+
+def _clean_detail_text(text: Any) -> str:
+    """Normalize Amazon detail text, including hidden direction marks."""
+    if text is None or (isinstance(text, float) and pd.isna(text)):
+        return ""
+    text = str(text)
+    text = re.sub(r"[\u200e\u200f\u202a-\u202e]", "", text)
+    text = text.replace("\xa0", " ")
+    return _clean_text(text)
+
+
+def _normalize_detail_label(label: Any) -> str:
+    label = _clean_detail_text(label)
+    label = re.sub(r"\s*[:：]\s*$", "", label)
+    return label.strip()
+
+
+def _clean_detail_value(value: Any, label: str) -> str:
+    value_text = _clean_detail_text(value)
+    label_text = _normalize_detail_label(label)
+    if not value_text:
+        return ""
+
+    if label_text:
+        escaped = re.escape(label_text)
+        value_text = re.sub(rf"^{escaped}\s*[:：]?\s*", "", value_text, flags=re.I)
+        value_text = re.sub(rf"\s*[:：]\s*{escaped}\s*[:：]?\s*$", "", value_text, flags=re.I)
+        value_text = re.sub(rf"\s*\|\s*{escaped}\s*[:：]?\s*$", "", value_text, flags=re.I)
+
+    return value_text.strip(" :-|")
+
+
+def _merge_unique(existing: Any, new_value: Any) -> str:
+    existing_text = _clean_detail_text(existing)
+    new_text = _clean_detail_text(new_value)
+    if not new_text:
+        return existing_text
+    if not existing_text:
+        return new_text
+
+    parts = [part.strip() for part in existing_text.split(" | ") if part.strip()]
+    if new_text not in parts:
+        parts.append(new_text)
+    return " | ".join(parts)
+
+
+def _add_product_detail(data: dict[str, Any], details_parts: list[str], label: Any, value: Any) -> None:
+    label_text = _normalize_detail_label(label)
+    value_text = _clean_detail_value(value, label_text)
+    if not label_text or not value_text or label_text.lower().startswith("customer"):
+        return
+
+    details_parts.append(f"{label_text}: {value_text}")
+    column = DETAIL_LABEL_TO_COLUMN.get(label_text)
+    if column and column != "asin":
+        data[column] = _merge_unique(data.get(column, ""), value_text)
+
+
+def _parse_product_details_text(raw_details: Any) -> dict[str, str]:
+    """Split existing raw product_details text into known detail columns."""
+    text = _clean_detail_text(raw_details)
+    if not text:
+        return {}
+
+    labels = sorted(DETAIL_LABEL_TO_COLUMN, key=len, reverse=True)
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    pattern = re.compile(rf"(?:^|\s+\|\s+)({label_pattern})\s*[:：]\s*", flags=re.I)
+    matches = list(pattern.finditer(text))
+    details: dict[str, str] = {}
+
+    for index, match in enumerate(matches):
+        raw_label = match.group(1)
+        label = next((candidate for candidate in labels if candidate.lower() == raw_label.lower()), raw_label)
+        column = DETAIL_LABEL_TO_COLUMN.get(label)
+        if not column or column == "asin":
+            continue
+
+        value_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        value = _clean_detail_value(text[match.end():value_end], label)
+        if value:
+            details[column] = _merge_unique(details.get(column, ""), value)
+
+    return details
+
+
+def _order_export_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    for column in EXPORT_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+
+    leading_columns = [column for column in EXPORT_COLUMNS if column != "product_details"]
+    extra_columns = [
+        column for column in df.columns
+        if column not in EXPORT_COLUMNS and column != "product_details"
+    ]
+    return df[leading_columns + extra_columns + ["product_details"]]
+
+
+def _write_products_excel(df: pd.DataFrame, filename: Path) -> None:
+    df = _order_export_dataframe(df.copy())
+    with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Products")
+        ws = writer.sheets["Products"]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        for column_index, column_name in enumerate(df.columns, start=1):
+            letter = get_column_letter(column_index)
+            if column_name in {"description", "features", "images", "product_details"}:
+                width = 60
+            elif column_name in {"url", "title"}:
+                width = 45
+            else:
+                sample = df[column_name].fillna("").astype(str).head(100)
+                max_len = max([len(str(column_name)), *(len(value) for value in sample)])
+                width = min(max(max_len + 2, 12), 35)
+            ws.column_dimensions[letter].width = width
+
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+
+def organize_existing_excel(source_path: str | Path, output_path: str | Path | None = None) -> Path:
+    """Create an organized copy of an existing scraper export."""
+    source = Path(source_path)
+    output = Path(output_path) if output_path else source.with_name(f"{source.stem}_organized{source.suffix}")
+    df = pd.read_excel(source)
+
+    if "product_details" in df.columns:
+        for index, raw_details in df["product_details"].items():
+            parsed_details = _parse_product_details_text(raw_details)
+            for column, value in parsed_details.items():
+                if column not in df.columns:
+                    df[column] = ""
+                df.at[index, column] = _merge_unique(df.at[index, column], value)
+
+    _write_products_excel(df, output)
+    return output
 
 
 def _parse_amazon_page(html: str, url: str, asin: str) -> dict[str, Any]:
@@ -132,8 +341,10 @@ def _parse_amazon_page(html: str, url: str, asin: str) -> dict[str, Any]:
         "seller": "",
         "availability": "",
         "features": "",
-        "product_details": "",
     }
+    for column in DETAIL_COLUMNS:
+        data[column] = ""
+    data["product_details"] = ""
 
     # ================================================================
     # 1. Title
@@ -368,7 +579,7 @@ def _parse_amazon_page(html: str, url: str, asin: str) -> dict[str, Any]:
     # ================================================================
     material_selectors = [
         "tr.po-material td.a-span9 span",
-        "#productDetails_techSpec_section_1 tr:contains('Material') td",
+        "#productDetails_techSpec_section_1 tr:-soup-contains('Material') td",
     ]
     for sel in material_selectors:
         material_el = soup.select_one(sel)
@@ -412,15 +623,19 @@ def _parse_amazon_page(html: str, url: str, asin: str) -> dict[str, Any]:
     # 14. Product Details Table
     # ================================================================
     details_parts = []
-    for row in soup.select("#productDetails_techSpec_section_1 tr, #detailBullets_feature_div li, #productDetails_detailBullets_sections1 tr"):
-        cells = row.select("th, td, span.a-text-bold, span.a-list-item")
-        if len(cells) >= 2:
-            key = _clean_text(cells[0].get_text()).rstrip(":")
-            val = _clean_text(cells[1].get_text()) if len(cells) > 1 else ""
-            if key and val and not key.startswith("Customer"):
-                details_parts.append(f"{key}: {val}")
+    for row in soup.select("#productDetails_techSpec_section_1 tr, #productDetails_detailBullets_sections1 tr"):
+        key_el = row.select_one("th")
+        value_el = row.select_one("td")
+        if key_el and value_el:
+            _add_product_detail(data, details_parts, key_el.get_text(), value_el.get_text())
+
+    for item in soup.select("#detailBullets_feature_div li"):
+        key_el = item.select_one("span.a-text-bold")
+        if key_el:
+            _add_product_detail(data, details_parts, key_el.get_text(), item.get_text(" ", strip=True))
+
     if details_parts:
-        data["product_details"] = " | ".join(details_parts[:15])
+        data["product_details"] = " | ".join(details_parts)
 
     return data
 
@@ -571,7 +786,7 @@ async def scrape_task(asins: list[str]) -> None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = DOWNLOADS_DIR / f"amazon_asin_{ts}.xlsx"
         df = pd.DataFrame(state["products"])
-        df.to_excel(filename, index=False, engine="openpyxl")
+        _write_products_excel(df, filename)
         state["output_file"] = str(filename)
         _log(f"✅ Saved {len(state['products'])} products → {filename.name}")
         if state["failed_count"] > 0:
@@ -641,6 +856,30 @@ async def upload_and_start(file: UploadFile = File(...)):
     
     if not valid_asins:
         return {"status": "error", "message": "No valid ASINs found in the uploaded file. ASINs should be 10 alphanumeric characters."}
+
+    if IS_VERCEL:
+        await scrape_task([a.upper() for a in valid_asins])
+        filepath = scraper_state.get("output_file")
+        if not filepath or not os.path.isfile(filepath):
+            return {
+                "status": "error",
+                "message": "Scraping finished, but no Excel file was generated.",
+                "logs": scraper_state["logs"],
+            }
+
+        with open(filepath, "rb") as f:
+            file_base64 = base64.b64encode(f.read()).decode("ascii")
+
+        return {
+            "status": "completed",
+            "message": "Scraping completed. Excel file is ready.",
+            "total": len(valid_asins),
+            "scraped": scraper_state["scraped_count"],
+            "failed": scraper_state["failed_count"],
+            "logs": scraper_state["logs"],
+            "file_name": os.path.basename(filepath),
+            "file_base64": file_base64,
+        }
 
     # Launch background task
     loop = asyncio.get_event_loop()

@@ -1,0 +1,10 @@
+.git
+.vercel
+__pycache__
+*.pyc
+downloads
+uploads
+*.xlsx
+*.xls
+.env
+.env.local
