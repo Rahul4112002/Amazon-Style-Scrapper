@@ -407,6 +407,105 @@
       }
     }
 
+    function updateProgressFromLog(msg) {
+      const matchProgress = msg.match(/\[(\d+)\/(\d+)\]/);
+      if (matchProgress) {
+        const scraped = parseInt(matchProgress[1]);
+        const total = parseInt(matchProgress[2]);
+        $('scraped-count').textContent = scraped;
+        const pct = total > 0 ? Math.round((scraped / total) * 100) : 0;
+        $('progress-bar').style.width = pct + '%';
+      }
+
+      if (msg.includes('FAILED') || msg.includes('CAPTCHA')) {
+        const currentFailed = parseInt($('failed-count').textContent) || 0;
+        $('failed-count').textContent = currentFailed + 1;
+      }
+
+      const matchTotal = msg.match(/(\d+)\s+ASINs/);
+      if (matchTotal) {
+        $('total-count').textContent = matchTotal[1];
+      }
+    }
+
+    function prepareDownload(fileBase64, fileName) {
+      const byteCharacters = atob(fileBase64);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const blob = new Blob([new Uint8Array(byteNumbers)], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      });
+      const downloadUrl = URL.createObjectURL(blob);
+      const downloadBtn = $('btn-download');
+      downloadBtn.href = downloadUrl;
+      downloadBtn.download = fileName;
+      downloadBtn.style.display = 'inline-block';
+    }
+
+    async function startStreamingScrape(formData) {
+      setRunning(true);
+      addLog('Uploading file and starting live scrape…');
+
+      const resp = await fetch('/upload-stream', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const contentType = resp.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const data = await resp.json();
+        addLog('❌ ' + (data.message || 'Could not start scraping.'));
+        setRunning(false);
+        return;
+      }
+
+      if (!resp.ok || !resp.body) {
+        addLog('❌ Could not start live scraping stream.');
+        setRunning(false);
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || '';
+
+        for (const eventText of events) {
+          const dataLine = eventText.split('\n').find(line => line.startsWith('data: '));
+          if (!dataLine) continue;
+
+          const event = JSON.parse(dataLine.slice(6));
+          if (event.type === 'log') {
+            addLog(event.message);
+            updateProgressFromLog(event.message);
+          } else if (event.type === 'file') {
+            $('scraped-count').textContent = event.scraped ?? $('scraped-count').textContent;
+            $('failed-count').textContent = event.failed ?? $('failed-count').textContent;
+            $('total-count').textContent = event.total ?? $('total-count').textContent;
+            $('progress-bar').style.width = '100%';
+            if (event.file_base64 && event.file_name) {
+              prepareDownload(event.file_base64, event.file_name);
+            }
+          } else if (event.type === 'error') {
+            addLog('❌ ' + event.message);
+          } else if (event.type === 'end') {
+            setRunning(false);
+          }
+        }
+      }
+
+      setRunning(false);
+    }
+
     // ---------- Scraping ----------
     async function startScraping() {
       if (!selectedFile) {
@@ -425,6 +524,11 @@
       // Upload file
       const formData = new FormData();
       formData.append('file', selectedFile);
+
+      if (window.location.hostname.includes('vercel.app')) {
+        await startStreamingScrape(formData);
+        return;
+      }
 
       const resp = await fetch('/upload', {
         method: 'POST',
@@ -451,19 +555,7 @@
         $('progress-bar').style.width = '100%';
         setRunning(false);
         if (data.file_base64 && data.file_name) {
-          const byteCharacters = atob(data.file_base64);
-          const byteNumbers = new Array(byteCharacters.length);
-          for (let i = 0; i < byteCharacters.length; i++) {
-            byteNumbers[i] = byteCharacters.charCodeAt(i);
-          }
-          const blob = new Blob([new Uint8Array(byteNumbers)], {
-            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-          });
-          const downloadUrl = URL.createObjectURL(blob);
-          const downloadBtn = $('btn-download');
-          downloadBtn.href = downloadUrl;
-          downloadBtn.download = data.file_name;
-          downloadBtn.style.display = 'inline-block';
+          prepareDownload(data.file_base64, data.file_name);
         }
         return;
       }
@@ -485,27 +577,7 @@
         }
         addLog(msg);
 
-        // Parse progress
-        const matchProgress = msg.match(/\[(\d+)\/(\d+)\]/);
-        if (matchProgress) {
-          const scraped = parseInt(matchProgress[1]);
-          const total = parseInt(matchProgress[2]);
-          $('scraped-count').textContent = scraped;
-          const pct = total > 0 ? Math.round((scraped / total) * 100) : 0;
-          $('progress-bar').style.width = pct + '%';
-        }
-
-        // Parse failed count
-        if (msg.includes('FAILED') || msg.includes('CAPTCHA')) {
-          const currentFailed = parseInt($('failed-count').textContent) || 0;
-          $('failed-count').textContent = currentFailed + 1;
-        }
-
-        // Parse total from start message
-        const matchTotal = msg.match(/(\d+)\s+ASINs/);
-        if (matchTotal) {
-          $('total-count').textContent = matchTotal[1];
-        }
+        updateProgressFromLog(msg);
       };
 
       evtSource.onerror = () => {

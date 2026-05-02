@@ -644,7 +644,7 @@ def _parse_amazon_page(html: str, url: str, asin: str) -> dict[str, Any]:
 # Core async scraping
 # ---------------------------------------------------------------------------
 
-async def _fetch(client: httpx.AsyncClient, url: str) -> str | None:
+async def _fetch(client: httpx.AsyncClient, url: str, log_func=_log) -> str | None:
     """GET a URL with retries."""
     for attempt in range(3):
         try:
@@ -653,12 +653,12 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> str | None:
             if resp.status_code == 200:
                 return resp.text
             elif resp.status_code == 503:
-                _log(f"⚠ Amazon rate limit (503), waiting...")
+                log_func(f"⚠ Amazon rate limit (503), waiting...")
                 await asyncio.sleep(random.uniform(5.0, 10.0))
             else:
-                _log(f"⚠ HTTP {resp.status_code} for {url}")
+                log_func(f"⚠ HTTP {resp.status_code} for {url}")
         except httpx.HTTPError as exc:
-            _log(f"⚠ Attempt {attempt+1} error: {exc}")
+            log_func(f"⚠ Attempt {attempt+1} error: {exc}")
         await asyncio.sleep(random.uniform(2.0, 4.0))
     return None
 
@@ -802,6 +802,100 @@ async def scrape_task(asins: list[str]) -> None:
     state["running"] = False
 
 
+async def scrape_products_live(asins: list[str], log_func) -> dict[str, Any]:
+    """Scrape ASINs without shared process state, suitable for streamed responses."""
+    products = []
+    captcha_asins = []
+    scraped_count = 0
+    failed_count = 0
+    total_items = len(asins)
+
+    log_func(f"🔍 Starting scrape for {total_items} ASINs…")
+
+    async def scrape_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, asin: str, is_retry: bool = False):
+        nonlocal scraped_count, failed_count
+        async with sem:
+            await asyncio.sleep(random.uniform(5.0, 10.0) if is_retry else random.uniform(1.5, 3.5))
+
+            url = f"https://www.amazon.in/dp/{asin}"
+            html = await _fetch(client, url, log_func=log_func)
+
+            if not html:
+                failed_count += 1
+                scraped_count += 1
+                log_func(f"✗ Failed to fetch ASIN: {asin}")
+                log_func(f"→ [{scraped_count}/{total_items}] FAILED — {asin}")
+                return None
+
+            if "Enter the characters you see below" in html or "api-services-support@amazon" in html:
+                if is_retry:
+                    failed_count += 1
+                    scraped_count += 1
+                    log_func(f"⚠ CAPTCHA again on retry for ASIN: {asin}")
+                    log_func(f"→ [{scraped_count}/{total_items}] CAPTCHA BLOCKED (retry failed) — {asin}")
+                    return None
+
+                log_func(f"⚠ CAPTCHA detected for ASIN: {asin} (will retry later)")
+                return "CAPTCHA:" + asin
+
+            data = _parse_amazon_page(html, url, asin)
+            scraped_count += 1
+            label = data.get("title")[:50] + "..." if data.get("title") and len(data.get("title", "")) > 50 else data.get("title") or asin
+            log_func(f"→ [{scraped_count}/{total_items}] {label}")
+            return data
+
+    async with httpx.AsyncClient(http2=False) as client:
+        sem = asyncio.Semaphore(MAX_CONCURRENCY)
+        tasks = [scrape_one(client, sem, str(asin), is_retry=False) for asin in asins]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, dict):
+                products.append(result)
+            elif isinstance(result, str) and result.startswith("CAPTCHA:"):
+                captcha_asins.append(result.replace("CAPTCHA:", ""))
+            elif isinstance(result, Exception):
+                failed_count += 1
+                log_func(f"⚠ Unexpected scrape error: {result}")
+
+        if captcha_asins:
+            log_func("")
+            log_func(f"🔄 Retrying {len(captcha_asins)} CAPTCHA-blocked ASINs after delay…")
+            log_func("⏳ Waiting 30 seconds before retry to avoid detection…")
+            await asyncio.sleep(30)
+
+            retry_tasks = [scrape_one(client, sem, asin, is_retry=True) for asin in captcha_asins]
+            retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
+
+            for result in retry_results:
+                if isinstance(result, dict):
+                    products.append(result)
+                    log_func(f"✅ Retry successful for: {result.get('asin', 'unknown')}")
+                elif isinstance(result, Exception):
+                    failed_count += 1
+                    log_func(f"⚠ Unexpected retry error: {result}")
+
+    output_file = None
+    if products:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = DOWNLOADS_DIR / f"amazon_asin_{ts}.xlsx"
+        _write_products_excel(pd.DataFrame(products), output_file)
+        log_func(f"✅ Saved {len(products)} products → {output_file.name}")
+        if failed_count > 0:
+            log_func(f"⚠ {failed_count} ASINs failed to scrape.")
+    else:
+        log_func("⚠ No products scraped — nothing to save.")
+
+    log_func("🏁 DONE")
+
+    return {
+        "output_file": output_file,
+        "scraped": scraped_count,
+        "failed": failed_count,
+        "total": total_items,
+    }
+
+
 # ---------------------------------------------------------------------------
 # FastAPI routes
 # ---------------------------------------------------------------------------
@@ -811,10 +905,87 @@ async def index(request: Request):
     return templates.TemplateResponse(request, "index.html")
 
 
+@app.post("/upload-stream")
+async def upload_and_stream(file: UploadFile = File(...)):
+    """Upload ASINs and stream scrape logs in one request for serverless hosting."""
+    fname = file.filename or ""
+    if not fname.lower().endswith((".xlsx", ".xls")):
+        return {"status": "error", "message": "Please upload an .xlsx or .xls file."}
+
+    save_path = UPLOADS_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{fname}"
+    contents = await file.read()
+    with open(save_path, "wb") as f:
+        f.write(contents)
+
+    try:
+        df = pd.read_excel(save_path)
+    except Exception as e:
+        return {"status": "error", "message": f"Could not read Excel file: {e}"}
+
+    asin_col = None
+    for col in df.columns:
+        col_lower = str(col).lower().strip()
+        if col_lower in ("asin", "asins", "asin_id", "product_id", "productid") or "asin" in col_lower:
+            asin_col = col
+            break
+    if asin_col is None:
+        asin_col = df.columns[0]
+
+    asins = df[asin_col].dropna().astype(str).str.strip().tolist()
+    asins = [asin.replace(".0", "") for asin in asins if asin and asin != "nan"]
+    valid_asins = [asin.upper() for asin in asins if re.match(r'^[A-Z0-9]{10}$', asin.upper())]
+
+    if not valid_asins:
+        return {"status": "error", "message": "No valid ASINs found in the uploaded file. ASINs should be 10 alphanumeric characters."}
+
+    async def event_generator():
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        def emit_log(message: str) -> None:
+            queue.put_nowait({"type": "log", "message": f"{_ts()} | {message}"})
+
+        async def run_scrape() -> None:
+            try:
+                result = await scrape_products_live(valid_asins, emit_log)
+                output_file = result.get("output_file")
+                payload = {
+                    "type": "file",
+                    "scraped": result["scraped"],
+                    "failed": result["failed"],
+                    "total": result["total"],
+                }
+                if output_file and os.path.isfile(output_file):
+                    with open(output_file, "rb") as f:
+                        payload["file_name"] = os.path.basename(output_file)
+                        payload["file_base64"] = base64.b64encode(f.read()).decode("ascii")
+                await queue.put(payload)
+            except Exception as exc:
+                await queue.put({"type": "error", "message": f"Scraping failed: {exc}"})
+            finally:
+                await queue.put({"type": "end"})
+
+        scrape_runner = asyncio.create_task(run_scrape())
+        while True:
+            event = await queue.get()
+            yield f"data: {json.dumps(event)}\n\n"
+            if event.get("type") == "end":
+                break
+        await scrape_runner
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/upload")
 async def upload_and_start(file: UploadFile = File(...)):
     """Upload an Excel file with ASINs and start scraping."""
-    if scraper_state["running"]:
+    if not IS_VERCEL and scraper_state["running"]:
         return {"status": "error", "message": "A scraping task is already running."}
 
     # Validate file type
